@@ -1,7 +1,20 @@
+"""Merge Alpha Vantage JSON payloads into a consolidated JSONL file."""
+from __future__ import annotations
+
+import argparse
+import glob
 import json
 import os
-import glob
+from typing import Iterable
 
+from alpha_vantage_utils import (
+    DEFAULT_TIMEZONE,
+    get_interval_config,
+    iter_symbols_from_filenames,
+    normalize_alpha_vantage_payload,
+    normalize_interval,
+    trim_latest_bar_to_buy,
+)
 
 all_nasdaq_100_symbols = [
     "NVDA", "MSFT", "AAPL", "GOOG", "GOOGL", "AMZN", "META", "AVGO", "TSLA",
@@ -14,54 +27,54 @@ all_nasdaq_100_symbols = [
     "NXPI", "DDOG", "AXON", "ROST", "IDXX", "EA", "PCAR", "FAST", "EXC", "TTWO",
     "XEL", "ZS", "PAYX", "WBD", "BKR", "CPRT", "CCEP", "FANG", "TEAM", "CHTR",
     "KDP", "MCHP", "GEHC", "VRSK", "CTSH", "CSGP", "KHC", "ODFL", "DXCM", "TTD",
-    "ON", "BIIB", "LULU", "CDW", "GFS"
+    "ON", "BIIB", "LULU", "CDW", "GFS",
 ]
 
-# 合并所有以 daily_price 开头的 json，逐文件一行写入 merged.jsonl
-current_dir = os.path.dirname(__file__)
-pattern = os.path.join(current_dir, 'daily_price*.json')
-files = sorted(glob.glob(pattern))
 
-output_file = os.path.join(current_dir, 'merged.jsonl')
+def _iter_price_files(pattern: str) -> Iterable[str]:
+    for filepath in sorted(glob.glob(pattern)):
+        yield filepath
 
-with open(output_file, 'w', encoding='utf-8') as fout:
-    for fp in files:
-        basename = os.path.basename(fp)
-        # 仅当文件名包含任一纳指100成分符号时才写入
-        if not any(symbol in basename for symbol in all_nasdaq_100_symbols):
-            continue
-        with open(fp, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        # 统一重命名："1. open" -> "1. buy price"；"4. close" -> "4. sell price"
-        # 对于最新的一天，只保留并写入 "1. buy price"
-        try:
-            # 查找所有以 "Time Series" 开头的键
-            series = None
-            for key, value in data.items():
-                if key.startswith("Time Series"):
-                    series = value
-                    break
-            if isinstance(series, dict) and series:
-                # 先对所有日期做键名重命名
-                for d, bar in list(series.items()):
-                    if not isinstance(bar, dict):
-                        continue
-                    if "1. open" in bar:
-                        bar["1. buy price"] = bar.pop("1. open")
-                    if "4. close" in bar:
-                        bar["4. sell price"] = bar.pop("4. close")
-                # 再处理最新日期，仅保留买入价
-                latest_date = max(series.keys())
-                latest_bar = series.get(latest_date, {})
-                if isinstance(latest_bar, dict):
-                    buy_val = latest_bar.get("1. buy price")
-                    series[latest_date] = {"1. buy price": buy_val} if buy_val is not None else {}
-                # 更新 Meta Data 描述
-                meta = data.get("Meta Data", {})
-                if isinstance(meta, dict):
-                    meta["1. Information"] = "Daily Prices (buy price, high, low, sell price) and Volumes"
-        except Exception:
-            # 若结构异常则原样写入
-            pass
 
-        fout.write(json.dumps(data, ensure_ascii=False) + "\n")
+def merge_price_files(interval: str, tz_name: str = DEFAULT_TIMEZONE) -> str:
+    """Merge individual JSON payloads into a JSONL file for the interval."""
+    canonical_interval = normalize_interval(interval)
+    config = get_interval_config(canonical_interval)
+
+    current_dir = os.path.dirname(__file__)
+    pattern = os.path.join(current_dir, f"{config['file_prefix']}*.json")
+    output_path = os.path.join(current_dir, config["merged_filename"])
+
+    files = list(_iter_price_files(pattern))
+    if not files:
+        raise FileNotFoundError(f"No price files found for pattern: {pattern}")
+
+    with open(output_path, "w", encoding="utf-8") as fout:
+        for filepath, symbol in iter_symbols_from_filenames(files):
+            if symbol not in all_nasdaq_100_symbols and symbol != "QQQ":
+                continue
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            normalized_payload, series_key = normalize_alpha_vantage_payload(
+                data, canonical_interval, tz_name=tz_name
+            )
+            series = normalized_payload.get(series_key)
+            if isinstance(series, dict) and config.get("trim_latest_to_buy"):
+                trim_latest_bar_to_buy(series)
+            fout.write(json.dumps(normalized_payload, ensure_ascii=False) + "\n")
+
+    return output_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Merge Alpha Vantage JSON payloads")
+    parser.add_argument("--interval", default="daily", help="Interval to merge: daily, 60min/hourly, or 15min")
+    parser.add_argument("--timezone", default=DEFAULT_TIMEZONE, help="IANA timezone for localization")
+    args = parser.parse_args()
+
+    output_path = merge_price_files(args.interval, tz_name=args.timezone)
+    print(f"✅ Wrote merged data to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
